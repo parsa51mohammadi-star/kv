@@ -28,6 +28,13 @@ SHARED_FILE = "self_shared.json"
 MIN_SPAM_INTERVAL = 3     # حداقل فاصله‌ی اسپم (ثانیه) تا اکانت محدود نشه
 ENEMY_COOLDOWN = 2        # حداقل فاصله‌ی جواب به یک نفر (ثانیه)
 
+SEND_TIMEOUT = 25         # بیشتر از این منتظر یک ارسال نمی‌مونیم
+HEARTBEAT_EVERY = 45      # هر چند ثانیه سلامت اتصال چک بشه
+HEARTBEAT_TIMEOUT = 25
+RECONNECT_MIN = 3         # فاصله‌ی اتصال مجدد (قبلا ۱۵ تا ۳۰۰ ثانیه بود!)
+RECONNECT_MAX = 30
+STOP_TIMEOUT = 8          # مهلت قطع کردن کلاینت موقع خاموش کردن
+
 IRAN_TZ = timezone(timedelta(hours=3, minutes=30))
 TIME_RE = re.compile(r"\s*\d{2}:\d{2}\s*$")
 
@@ -36,6 +43,18 @@ LOG = collections.deque(maxlen=80)
 
 def log(msg):
     LOG.append(time.strftime("%H:%M:%S") + "  " + str(msg))
+
+
+def _is_flood(e):
+    return "Flood" in type(e).__name__
+
+
+async def _safe_disconnect(client):
+    """قطع کردن کلاینت با مهلت؛ هیچ‌وقت برای همیشه گیر نمی‌کنه"""
+    try:
+        await asyncio.wait_for(client.disconnect(), STOP_TIMEOUT)
+    except (Exception, asyncio.CancelledError):
+        pass
 
 
 def bold_digits(s):
@@ -114,6 +133,11 @@ class Account:
         self.admin_id = spec.get("admin_id")
         self.config_file = os.path.join(DATA_DIR, f"cfg_{self.name}.json")
         self.client = SoroushClient(StringSession(spec["session"]))
+        # اگه کتابخونه روی FloodWait تا ۶۰ ثانیه می‌خوابید، همه‌ی جواب‌ها یک دقیقه دیر می‌شد
+        try:
+            self.client.flood_sleep_threshold = 3
+        except Exception:
+            pass
         self.cfg = self._load()
         self.is_off = False
         self.connected = False
@@ -138,23 +162,30 @@ class Account:
     # ---------- ارسال امن ----------
     async def send(self, chat_id, text):
         try:
-            return await self.client.send_message(chat_id, text)
-        except Exception:
+            return await asyncio.wait_for(self.client.send_message(chat_id, text), SEND_TIMEOUT)
+        except Exception as e:
+            if _is_flood(e) or isinstance(e, asyncio.TimeoutError):
+                log(f"[{self.name}] ارسال رد شد ({type(e).__name__})")
+                return None
             try:
-                return await self.client.send_message(
-                    chat_id, _MENTION_RE.sub(r"\1", text), parse_mode=None)
-            except Exception as e:
-                log(f"[{self.name}] خطا در ارسال به {chat_id}: {e!r}")
+                return await asyncio.wait_for(self.client.send_message(
+                    chat_id, _MENTION_RE.sub(r"\1", text), parse_mode=None), SEND_TIMEOUT)
+            except Exception as e2:
+                log(f"[{self.name}] خطا در ارسال به {chat_id}: {e2!r}")
                 return None
 
     async def say(self, event, text):
         try:
-            return await event.reply(text)
-        except Exception:
+            return await asyncio.wait_for(event.reply(text), SEND_TIMEOUT)
+        except Exception as e:
+            if _is_flood(e) or isinstance(e, asyncio.TimeoutError):
+                log(f"[{self.name}] پاسخ رد شد ({type(e).__name__})")
+                return None
             try:
-                return await event.reply(_MENTION_RE.sub(r"\1", text), parse_mode=None)
-            except Exception as e:
-                log(f"[{self.name}] خطا در پاسخ: {e!r}")
+                return await asyncio.wait_for(
+                    event.reply(_MENTION_RE.sub(r"\1", text), parse_mode=None), SEND_TIMEOUT)
+            except Exception as e2:
+                log(f"[{self.name}] خطا در پاسخ: {e2!r}")
                 return None
 
     def pick_text(self):
@@ -287,6 +318,8 @@ class Account:
                 key = (event.chat_id, sender)
                 now = time.time()
                 if now - self.enemy_last.get(key, 0) >= ENEMY_COOLDOWN:
+                    if len(self.enemy_last) > 2000:
+                        self.enemy_last.clear()
                     self.enemy_last[key] = now
                     txt = self.pick_text()
                     if self.cfg["enemy_reply"]:
@@ -839,7 +872,8 @@ async def _finish_login():
     _write_json(ACC_FILE, specs)
     log(f"✅ اکانت {spec['name']} ({phone}) ذخیره شد.")
     if _state["running"]:
-        _launch(spec, force=True)
+        async with _lock():
+            await _launch(spec, force=True)
     return "OK"
 
 
@@ -878,6 +912,34 @@ def sign_in_password(password):
 
 
 # ================== روشن / خاموش ==================
+_lifecycle = None
+_expired = set()   # اکانت‌هایی که سشنشون منقضی شده
+
+
+def _lock():
+    global _lifecycle
+    if _lifecycle is None:
+        _lifecycle = asyncio.Lock()
+    return _lifecycle
+
+
+async def _heartbeat(acc):
+    """اگه اتصال بی‌صدا مرده باشه (تعویض وای‌فای/دیتا، Doze) خودش قطعش می‌کنه تا دوباره وصل بشه"""
+    fails = 0
+    while True:
+        await asyncio.sleep(HEARTBEAT_EVERY)
+        try:
+            await asyncio.wait_for(acc.client.get_me(), HEARTBEAT_TIMEOUT)
+            fails = 0
+        except Exception as e:
+            fails += 1
+            log(f"[{acc.name}] چک اتصال ناموفق ({type(e).__name__})")
+            if fails >= 2:
+                log(f"[{acc.name}] اتصال مرده بود؛ دوباره وصل می‌شم")
+                await _safe_disconnect(acc.client)
+                return
+
+
 async def _run_account(spec):
     name = spec["name"]
     try:
@@ -886,20 +948,23 @@ async def _run_account(spec):
         log(f"[{name}] ساخت کلاینت نشد: {e!r}")
         return
     _accs[name] = acc
-    delay = 15
+    delay = RECONNECT_MIN
     try:
         while _state["running"]:
+            hb = None
             try:
                 log(f"[{name}] در حال اتصال به سروش...")
-                await acc.client.connect()
-                if not await acc.client.is_user_authorized():
+                await asyncio.wait_for(acc.client.connect(), 40)
+                if not await asyncio.wait_for(acc.client.is_user_authorized(), 30):
                     log(f"[{name}] سشن منقضی شده؛ از بخش «اکانت‌ها» دوباره وارد شو.")
+                    _expired.add(name)
                     return
-                me = await acc.client.get_me()
+                me = await asyncio.wait_for(acc.client.get_me(), 30)
                 acc.connected = True
                 log(f"✅ [{name}] روشن شد → id={getattr(me, 'id', '?')} | {getattr(me, 'first_name', '?')}")
                 acc.start_background()
-                delay = 15
+                delay = RECONNECT_MIN
+                hb = asyncio.ensure_future(_heartbeat(acc))
                 await acc.client.run_until_disconnected()
                 log(f"[{name}] ارتباط قطع شد.")
             except asyncio.CancelledError:
@@ -907,6 +972,8 @@ async def _run_account(spec):
             except Exception as e:
                 log(f"[{name}] خطا ({type(e).__name__}): {e}")
             finally:
+                if hb is not None:
+                    hb.cancel()
                 acc.connected = False
                 acc.stop_all()
                 acc.save()
@@ -914,57 +981,62 @@ async def _run_account(spec):
                 break
             log(f"[{name}] {delay} ثانیه دیگه دوباره وصل می‌شم...")
             await asyncio.sleep(delay)
-            delay = min(delay * 2, 300)
+            delay = min(delay * 2, RECONNECT_MAX)
     finally:
         acc.connected = False
-        try:
-            await acc.client.disconnect()
-        except (Exception, asyncio.CancelledError):
-            pass
+        await _safe_disconnect(acc.client)
         if _accs.get(name) is acc:
             _accs.pop(name, None)
 
 
-def _launch(spec, force=False):
+async def _launch(spec, force=False):
     name = spec["name"]
+    if name in _expired and not force:
+        return
     old = _tasks.get(name)
     if old is not None and not old.done():
         if not force:
             return
         old.cancel()
+        # صبر می‌کنیم کلاینت قدیمی کامل بسته بشه تا دو کلاینت هم‌زمان با یک سشن نداشته باشیم
+        await asyncio.wait({old}, timeout=STOP_TIMEOUT + 4)
+    _expired.discard(name)
     _tasks[name] = asyncio.ensure_future(_run_account(spec))
 
 
 async def _start_all():
-    _state["running"] = True
-    for spec in _read_json(ACC_FILE, []):
-        _launch(spec)
-    log("ربات روشن شد.")
+    async with _lock():
+        _state["running"] = True
+        for spec in _read_json(ACC_FILE, []):
+            await _launch(spec)
+        log("ربات روشن شد.")
 
 
 async def _stop_all():
-    _state["running"] = False
-    tasks = list(_tasks.values())
-    for t in tasks:
-        t.cancel()
-    if tasks:
-        await asyncio.gather(*tasks, return_exceptions=True)
-    _tasks.clear()
-    log("ربات خاموش شد.")
+    async with _lock():
+        _state["running"] = False
+        tasks = list(_tasks.values())
+        for t in tasks:
+            t.cancel()
+        if tasks:
+            await asyncio.wait(tasks, timeout=STOP_TIMEOUT + 4)
+        _tasks.clear()
+        log("ربات خاموش شد.")
 
 
 async def _remove_account(name):
-    t = _tasks.pop(name, None)
-    if t is not None:
-        t.cancel()
-        await asyncio.gather(t, return_exceptions=True)
-    specs = [s for s in _read_json(ACC_FILE, []) if s.get("name") != name]
-    _write_json(ACC_FILE, specs)
-    try:
-        os.remove(os.path.join(DATA_DIR, f"cfg_{name}.json"))
-    except OSError:
-        pass
-    log(f"اکانت {name} حذف شد.")
+    async with _lock():
+        t = _tasks.pop(name, None)
+        if t is not None:
+            t.cancel()
+            await asyncio.wait({t}, timeout=STOP_TIMEOUT + 4)
+        specs = [s for s in _read_json(ACC_FILE, []) if s.get("name") != name]
+        _write_json(ACC_FILE, specs)
+        try:
+            os.remove(os.path.join(DATA_DIR, f"cfg_{name}.json"))
+        except OSError:
+            pass
+        log(f"اکانت {name} حذف شد.")
 
 
 def start_bot():
@@ -973,7 +1045,10 @@ def start_bot():
 
 
 def stop_bot():
-    _run(_stop_all(), timeout=30)
+    try:
+        _run(_stop_all(), timeout=45)
+    except Exception as e:
+        log(f"خاموش کردن کامل نشد: {e!r}")
     return "OK"
 
 
