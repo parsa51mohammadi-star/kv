@@ -3,6 +3,7 @@ package ir.parsa.bot
 import android.Manifest
 import android.app.Activity
 import android.app.AlertDialog
+import android.content.ComponentName
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.graphics.Color
@@ -55,6 +56,7 @@ class MainActivity : Activity() {
     private var logView: TextView? = null
     private var lastAccKey = ""
     private var accountCount = -1
+    private var lastKick = 0L
 
     // ---------------------------------------------------------------- چرخه‌ی عمر
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -114,12 +116,50 @@ class MainActivity : Activity() {
 
     override fun onResume() {
         super.onResume()
+        // اگه ربات باید روشن باشه ولی سرویس (مثلا توسط گوشی) کشته شده، دوباره بالا بیار
+        ensureService()
         if (tab == 2) startRefresh()
     }
 
     override fun onPause() {
         stopRefresh()
         super.onPause()
+    }
+
+    private fun ensureService() {
+        if (!Core.enabled(this)) return
+        try {
+            startForegroundService(Intent(this, BotService::class.java))
+        } catch (_: Throwable) {
+        }
+    }
+
+    /** باز کردن صفحه‌ی «شروع خودکار» در گوشی‌هایی که برنامه‌ی بسته‌شده را می‌کشند */
+    private fun openAutostart() {
+        val targets = listOf(
+            "com.miui.securitycenter" to "com.miui.permcenter.autostart.AutoStartManagementActivity",
+            "com.huawei.systemmanager" to "com.huawei.systemmanager.startupmgr.ui.StartupNormalAppListActivity",
+            "com.huawei.systemmanager" to "com.huawei.systemmanager.optimize.process.ProtectActivity",
+            "com.coloros.safecenter" to "com.coloros.safecenter.permission.startup.StartupAppListActivity",
+            "com.oppo.safe" to "com.oppo.safe.permission.startup.StartupAppListActivity",
+            "com.vivo.permissionmanager" to "com.vivo.permissionmanager.activity.BgStartUpManagerActivity",
+            "com.samsung.android.lool" to "com.samsung.android.sm.ui.battery.BatteryActivity",
+            "com.asus.mobilemanager" to "com.asus.mobilemanager.powersaver.PowerSaverSettings"
+        )
+        for ((pkg, cls) in targets) {
+            try {
+                startActivity(Intent().setComponent(ComponentName(pkg, cls)))
+                return
+            } catch (_: Throwable) {
+            }
+        }
+        try {
+            startActivity(
+                Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS)
+                    .setData(Uri.parse("package:$packageName"))
+            )
+        } catch (_: Throwable) {
+        }
     }
 
     // ---------------------------------------------------------------- ابزارهای ظاهر
@@ -413,6 +453,10 @@ class MainActivity : Activity() {
             setOnClickListener { requestBatteryExemption() }
         }
 
+        val autoBtn = button("تنظیم شروع خودکار (شیائومی/سامسونگ/...)", cTabOff).apply {
+            setOnClickListener { openAutostart() }
+        }
+
         val v = page(
             statusView!!,
             toggleBtn!!,
@@ -420,6 +464,7 @@ class MainActivity : Activity() {
             accountsBox!!,
             addBtn,
             batteryBtn,
+            autoBtn,
             label("گزارش اجرا", 18f, true),
             logView!!
         )
@@ -450,6 +495,10 @@ class MainActivity : Activity() {
             } catch (e: Throwable) {
                 Core.setEnabled(this, false)
                 toast("روشن نشد: ${e.message}")
+            }
+            val pm = getSystemService(PowerManager::class.java)
+            if (Core.enabled(this) && !pm.isIgnoringBatteryOptimizations(packageName)) {
+                requestBatteryExemption()
             }
         }
         updateToggle()
@@ -510,6 +559,12 @@ class MainActivity : Activity() {
                     setTextColor(cGreen)
                 }
                 on -> {
+                    // گیر کرده؟ هر ۱۰ ثانیه سرویس را دوباره راه بینداز
+                    val now = System.currentTimeMillis()
+                    if (now - lastKick > 10_000) {
+                        lastKick = now
+                        ensureService()
+                    }
                     text = "🟡 در حال راه‌اندازی..."
                     setTextColor(Color.parseColor("#E0A800"))
                 }
