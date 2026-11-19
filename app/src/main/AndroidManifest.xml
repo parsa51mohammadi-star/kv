@@ -14,6 +14,7 @@
     <application
         android:name="com.chaquo.python.android.PyApplication"
         android:allowBackup="false"
+        android:largeHeap="true"
         android:label="ربات پارسا"
         android:supportsRtl="true">
 
@@ -34,6 +35,7 @@
         <service
             android:name=".BotService"
             android:exported="false"
+            android:stopWithTask="false"
             android:foregroundServiceType="specialUse">
             <property
                 android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
@@ -45,6 +47,7 @@
             android:exported="true">
             <intent-filter>
                 <action android:name="android.intent.action.BOOT_COMPLETED" />
+                <action android:name="android.intent.action.QUICKBOOT_POWERON" />
             </intent-filter>
         </receiver>
     </application>
