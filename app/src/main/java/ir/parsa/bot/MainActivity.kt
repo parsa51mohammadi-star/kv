@@ -126,6 +126,14 @@ class MainActivity : Activity() {
         super.onPause()
     }
 
+    private fun openLink(url: String) {
+        try {
+            startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(url)))
+        } catch (_: Throwable) {
+            toast("بازشدن لینک ممکن نشد؛ مطمئن شو برنامه‌ی مربوطه نصب است.")
+        }
+    }
+
     private fun ensureService() {
         if (!Core.enabled(this)) return
         try {
@@ -346,6 +354,16 @@ class MainActivity : Activity() {
                 "هشدار",
                 "رشته‌ی سشن اکانت مثل رمز حساب است و فقط داخل حافظه‌ی خصوصی همین برنامه ذخیره می‌شود. جایی منتشرش نکن. استفاده‌ی زیاد از اسپم و پاسخ خودکار ممکن است باعث محدود شدن اکانت شود."
             ),
+            card(
+                "سازنده",
+                "ساخته شده توسط پارسا\nآیدی: @Hoshmokharb\nبرای ارتباط مستقیم با سازنده یکی از دکمه‌ها را بزن."
+            ),
+            button("پیام در سروش پلاس", cBlue).apply {
+                setOnClickListener { openLink("https://splus.ir/Hoshmokharb") }
+            },
+            button("پیام در تلگرام", cBlue).apply {
+                setOnClickListener { openLink("https://t.me/Hoshmokharb") }
+            },
             go,
             panel
         )
